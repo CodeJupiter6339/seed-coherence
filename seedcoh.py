@@ -7,10 +7,12 @@ sheet; a cluster of distances near one sheet spacing means one of them switched 
 
   seedcoh.py seeds  MESH [--offset 3]            -> 4 seed points on MESH around its meta.json seed
   seedcoh.py score  DIR DIR [DIR ...] [--json F] -> pairwise agreement, distance histogram, agreement vs. distance from seeds
+  seedcoh.py select DIR DIR [DIR ...] [--json F] -> medoid surface (best median agreement, one-wrap mass penalised), or "none"
+  seedcoh.py trim   DIR OTHER [OTHER ...] --out M -> mask (M.npy + M.json) of the seed-connected part supported by >= 2/3 of the others
 """
 import argparse, itertools, json, os, sys
 import numpy as np, tifffile
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, label, binary_propagation
 from scipy.spatial import cKDTree
 
 BINS = [0, 2, 4, 8, 11, 19, 26, 34, 41, 60]
@@ -42,9 +44,14 @@ def mesh_seed(d):
 
 
 def cmd_seeds(a):
-    P, v = load(a.mesh); s = mesh_seed(a.mesh)
-    D = np.linalg.norm(P - s, axis=-1); D[~v] = np.inf
-    i, j = np.unravel_index(np.argmin(D), D.shape); k = a.offset
+    P, v = load(a.mesh)
+    if a.center:  # fractional grid position, e.g. 0.5,0.5; snapped to the nearest valid vertex
+        fi, fj = map(float, a.center.split(","))
+        ii, jj = np.nonzero(v); t = np.argmin((ii - fi * v.shape[0]) ** 2 + (jj - fj * v.shape[1]) ** 2); i, j = ii[t], jj[t]
+    else:
+        s = mesh_seed(a.mesh); D = np.linalg.norm(P - s, axis=-1); D[~v] = np.inf
+        i, j = np.unravel_index(np.argmin(D), D.shape)
+    k = a.offset
     for n, (di, dj) in zip("ABCD", ((k, 0), (-k, 0), (0, k), (0, -k))):
         ii, jj = i + di, j + dj
         if not (0 <= ii < v.shape[0] and 0 <= jj < v.shape[1] and v[ii, jj]):
@@ -84,15 +91,58 @@ def cmd_score(a):
     print(json.dumps({k: out[k] for k in out if k != "pairs"}, indent=1))
     if a.json: json.dump(out, open(a.json, "w"), indent=1)
 
+def dists(S, T):
+    """D[x][y]: distance of each vertex of surface x to surface y (60 when farther)."""
+    return {(x, y): np.minimum(T[y].query(S[x][0][S[x][1]], distance_upper_bound=60.0)[0], 60.0) for x in S for y in S if x != y}
+
+
+def cmd_select(a):
+    S = {d: load(d) for d in a.dirs}; T = {d: cKDTree(dense(*S[d])) for d in S}; D = dists(S, T)
+    zone = {x: np.linalg.norm(S[x][0][S[x][1]] - mesh_seed(x), axis=1) < 100 for x in S}  # ring 0-100 around its own seed
+    res = {}
+    for x in S:
+        o = [y for y in S if y != x]
+        le4 = [np.mean(D[x, y] <= 4) for y in o]; wrap = np.mean([np.mean((D[x, y] > 11) & (D[x, y] <= 19)) for y in o])
+        near = [np.mean(D[x, y][zone[x]] <= 4) >= 0.5 if zone[x].any() else False for y in o]  # y agrees on x's seed zone
+        res[x] = dict(median_le4=float(np.median(le4)), one_wrap_11_19=float(wrap), score=float(np.median(le4) - wrap), support=float(np.mean(near)))
+    best = max(res, key=lambda x: res[x]["score"]); sup = max(r["support"] for r in res.values())
+    out = dict(choice=best if sup >= 2 / 3 - 1e-9 else None, max_support=sup, surfaces=res)
+    print(out["choice"] or "none", json.dumps({k: round(v, 3) for k, v in res[best].items()}), f"max_support={sup:.2f}")
+    if a.json: json.dump(out, open(a.json, "w"), indent=1)
+
+
+def trim_mask(S, T, x, others, low=2 / 3):
+    """Support of each vertex of x = share of `others` within 4 vx; keep the seed-connected part (>= 2/3, grown down to `low`)."""
+    P, v = S[x]; n = np.zeros(v.shape); d = np.zeros(v.shape)
+    for y in others:
+        dy = np.minimum(T[y].query(P[v], distance_upper_bound=60.0)[0], 60.0); n[v] += dy <= 4; d[v] += dy / len(others)
+    sup = n / len(others); R = np.linalg.norm(P - mesh_seed(x), axis=-1)
+    strong = v & (sup >= 2 / 3 - 1e-9); lab, _ = label(strong)  # the seed vertex itself may sit on a ragged edge: use the nearest supported vertex within 20 vx
+    R[~strong] = np.inf; seed = np.unravel_index(np.argmin(R), R.shape); keep = lab == lab[seed] if R[seed] < 20 else np.zeros(v.shape, bool)
+    if low < 2 / 3 - 1e-9 and keep.any(): keep = binary_propagation(keep, mask=v & (sup >= low - 1e-9))
+    return keep, sup, d
+
+
+def cmd_trim(a):
+    S = {d: load(d) for d in [a.surf] + a.others}; T = {d: cKDTree(dense(*S[d])) for d in a.others}
+    keep, sup, _ = trim_mask(S, T, a.surf, a.others, a.low); v = S[a.surf][1]
+    np.save(a.out + ".npy", keep); out = dict(surface=a.surf, others=len(a.others), kept_vertices=int(keep.sum()), valid_vertices=int(v.sum()), kept_share=float(keep.sum() / v.sum()))
+    json.dump(out, open(a.out + ".json", "w"), indent=1); print(out)
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest="cmd", required=True)
     s = sp.add_parser("seeds"); s.add_argument("mesh"); s.add_argument("--offset", type=int, default=3, help="grid cells from the seed vertex")
+    s.add_argument("--center", help="use this fractional grid position (i,j) of MESH instead of its meta.json seed")
     s = sp.add_parser("score"); s.add_argument("dirs", nargs="+"); s.add_argument("--json")
+    s = sp.add_parser("select"); s.add_argument("dirs", nargs="+"); s.add_argument("--json")
+    s = sp.add_parser("trim"); s.add_argument("surf"); s.add_argument("others", nargs="+"); s.add_argument("--out", required=True)
+    s.add_argument("--low", type=float, default=2 / 3, help="hysteresis: keep growing the kept zone down to this support")
     a = ap.parse_args()
+    if a.cmd == "select" and len(a.dirs) < 3: ap.error("select needs at least three surfaces")
     if a.cmd == "score" and len(a.dirs) < 2: ap.error("score needs at least two surfaces")
-    {"seeds": cmd_seeds, "score": cmd_score}[a.cmd](a)
+    {"seeds": cmd_seeds, "score": cmd_score, "select": cmd_select, "trim": cmd_trim}[a.cmd](a)
 
 
 if __name__ == "__main__":

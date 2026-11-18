@@ -46,10 +46,51 @@ python3 seedcoh.py score A/g140 B/g140 C/g140 D/g140 --json score.json
 
 Distances are point to surface: the other mesh is densified with bilinear points (8 × 8 per quad) before the nearest-neighbour query.
 
-`python3 tests/test_seedcoh.py` runs two synthetic checks: a mesh against a copy of itself, and against a copy shifted by 15 vx.
+`python3 tests/test_seedcoh.py` runs two synthetic checks: a mesh against a copy of itself, and against a copy shifted by 15 vx. `python3 -m pytest tests` runs those and the `select`/`trim` tests below (needs numpy, scipy, tifffile, pytest).
+
+## Choosing one surface and trimming it: `select` and `trim`
+
+`score` only measures. These two subcommands act on the same agreement signal.
+
+```bash
+# pick one surface out of 3 or more grown from the same site
+python3 seedcoh.py select A B C D --json select.json
+# keep only the part of one surface that the others support
+python3 seedcoh.py trim A B C D --out A_trim            # writes A_trim.npy and A_trim.json
+python3 seedcoh.py trim A B C D --out A_trim --low 0.5  # also grow the kept zone down to 50 % support
+```
+
+**What `select` measures.** For each surface X, it takes the share of X's vertices within 4 vx of each other surface, and keeps the median over the others. It subtracts the mean share of vertices 11 to 19 vx away (the one-wrap band), so a surface that sits a wrap off from the others loses points. The highest score is the choice. It also computes a support value for each surface: the share of the other surfaces that agree (≥ 50 % of vertices within 4 vx) inside the 100 vx ring around X's own seed. If no surface reaches a support of 2/3, `select` prints `none` and chooses nothing. Abstaining is deliberate: when the surfaces split into two camps, there is no majority sheet to pick.
+
+**What `trim` measures.** For each vertex of the surface, the support is the share of the other surfaces within 4 vx. Vertices with support of at least 2/3 are kept if they are connected (in the grid) to the seed, using the nearest supported vertex within 20 vx of the seed. Everything past the point where the others disagree is dropped. The output is a boolean mask over the grid (`.npy`) plus a small `.json` with the kept share. `trim` does not modify the surface files.
+
+Both need the same kind of input as `score`: tifxyz directories with `x.tif`, `y.tif`, `z.tif` and a `meta.json` carrying the seed. The `scale` field is not read; vertices are taken as stored, with x and z above 0 counting as valid.
+
+### Results on real data
+
+These are single runs on two scrolls. Read them as case reports, not as a benchmark.
+
+- **PHerc0490A, z50, without a seed anchor.** Seed D grew one wrap away from the others. `select` discarded it (median agreement 0, with 42 % of its mass at 11 to 19 vx) and chose B.
+- **PHerc0490A, z50, with `seed_anchor_xyz`** (the option ChaseHendrick added in villa #2063). The four surfaces agree and support is 1.0 for all of them. See `docs/seed-anchor.md`.
+- **PHerc0841, against the human segment w00.** No net gain. The error of the selected surface is 0.851, against 0.866 for a random pick and 0.820 for the oracle (the best of the four). The reason is that nearly all four default traces sit off w00, so there is little to choose from. `select` abstained (`none`) in 5 of the 8 sets.
+
+In short: `select` removed the surface that hopped a wrap on PHerc0490A, and it did not help on PHerc0841, where nearly all candidates are wrong.
+
+### Synthetic tests
+
+`tests/test_select_trim.py` builds tifxyz surfaces as parallel planes 15 vx apart, standing in for neighbouring wraps. It checks that:
+
+1. four identical surfaces (up to noise) give a choice and support 1;
+2. three surfaces on one sheet and one 15 vx away: the odd one is never chosen, and `trim` keeps 0 % of it while the others keep everything;
+3. two surfaces on each of two sheets: `select` abstains;
+4. a surface that jumps to the next sheet halfway: `trim` keeps the half on the seed's side (and nothing if the seed is on the jumped side).
 
 ## Limits
 
+- `select` and `trim` rely on the majority. If most of the surfaces left the sheet together, they agree with each other and `select` picks a surface on the wrong sheet. If all of them are wrong, as on PHerc0841, neither can help.
+- `select` needs at least 3 surfaces, and with 4 a 2 against 2 split makes it abstain. The thresholds (4 vx, 2/3, the 11-19 vx band, 100 vx ring) are fixed in the code, and the 11-19 vx band comes from PHerc0490A.
+- `trim` keeps only what is connected to the seed. If the seed itself is on the wrong sheet, it keeps the wrong part.
+- The evidence is one PHerc0490A case, one PHerc0841 comparison and synthetic planes. The tests do not cover curved or overlapping sheets.
 - One scroll, three regions, four seeds per region. It is a measurement, not a ranking of methods yet.
 - Disagreement tells you that at least one of the two surfaces left the sheet, not which one.
 - The tracer is not deterministic with several threads. Two identical runs gave different meshes, about 0.5 percentage points apart on edge-quality metrics, so small differences between methods need repeats.
@@ -62,3 +103,7 @@ Distances are point to surface: the other mesh is densified with bilinear points
 - Normal grids: the published `...surface-m7-L0-th0.2.normal-grids` next to the prediction.
 
 MIT licence.
+
+## Notes
+
+- [Checking `seed_anchor_xyz` (villa #2063) on PHerc0490A and PHerc0841](docs/seed-anchor.md): the anchor fixes starts on the neighbouring wrap but does not keep long traces on the sheet.
