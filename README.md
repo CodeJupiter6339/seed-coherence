@@ -1,5 +1,7 @@
 # seed-coherence
 
+[![tests](https://github.com/CodeJupiter6339/seed-coherence/actions/workflows/tests.yml/badge.svg)](https://github.com/CodeJupiter6339/seed-coherence/actions/workflows/tests.yml)
+
 A label-free check for sheet switches in GrowPatch surfaces.
 
 Put four seeds on the same sheet, about 60 voxels apart. Grow each one with `vc_grow_seg_from_seed`, then measure, for every vertex of one surface, its distance to each other surface. If two surfaces followed the same sheet they overlap. If one of them switched wraps, its vertices land about one sheet spacing away (11 to 19 voxels on PHerc0490A at 8.64 µm). The scorer needs no ground truth or labels, only the meshes.
